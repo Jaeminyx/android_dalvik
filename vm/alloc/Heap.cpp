@@ -142,18 +142,25 @@ void dvmHeapThreadShutdown()
  */
 bool dvmLockHeap()
 {
-    if (dvmTryLockMutex(&gDvm.gcHeapLock) != 0) {
+    /* This is hacked a bit to avoid deadlocks.  Basically I don't want a thread
+     * to suspend itself hodling the heap lock. */
+    int res;
+    while ((res = dvmTryLockMutex(&gDvm.gcHeapLock)) != 0) {
+        assert(res == EBUSY);
+
         Thread *self;
         ThreadStatus oldStatus;
 
         self = dvmThreadSelf();
         oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
         dvmLockMutex(&gDvm.gcHeapLock);
+        dvmUnlockMutex(&gDvm.gcHeapLock);
         dvmChangeStatus(self, oldStatus);
     }
 
     return true;
 }
+
 
 void dvmUnlockHeap()
 {
@@ -531,6 +538,10 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
     LOGD_HEAP("Recursing...");
     dvmHeapScanMarkedObjects();
 
+#ifdef WITH_OFFLOAD
+    offGcMarkOffloadRefs(spec, false);
+#endif
+
     if (spec->isConcurrent) {
         /*
          * Re-acquire the heap lock and perform the final thread
@@ -556,6 +567,9 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
          * heap objects dirtied during the concurrent mark.
          */
         dvmHeapReScanMarkedObjects();
+#ifdef WITH_OFFLOAD
+        offGcMarkOffloadRefs(spec, true);
+#endif
     }
 
     /*
