@@ -100,6 +100,65 @@ static int signalThread(void* pthread, void* arg) {
   return 0;
 }
 
+static void message_loop_server(int s) {
+    
+  ALOGI("Starting message loop");
+
+  u1 magic_value = 0x55;
+  if(1 != write(s, &magic_value, 1)) return;
+  if(1 != read(s, &magic_value, 1)) return;
+  if(magic_value != 0x55) {
+    ALOGW("Bad magic value from server");
+    return;
+  }
+  gDvm.offConnected = true;
+  gDvm.offRecovered = false;
+
+  int res;
+  Queue wthreads = auxQueueCreate();
+  Thread* wthread;
+
+  MsgHeader rhdr;
+  int rst = 0; u4 rsz = sizeof(rhdr); u4 rpos = 0;
+  char rbuf[2*MAX_CONTROL_VPACKET_SIZE];
+
+  MsgHeader whdr;
+  int wst = -1; u4 wsz = sizeof(whdr); u4 wpos = 0;
+  u4 owsz = -1;
+  char* wbuf = NULL;
+
+#ifdef USE_COMPRESSION
+  char rbuftmp[2*MAX_CONTROL_VPACKET_SIZE];
+  char wtmpbuf[2*MAX_CONTROL_VPACKET_SIZE];
+
+  z_stream wstrm;
+  wstrm.zalloc = Z_NULL; wstrm.zfree = Z_NULL; wstrm.opaque = Z_NULL;
+  deflateInit(&wstrm, Z_LEVEL);
+
+  z_stream rstrm;
+  rstrm.zalloc = Z_NULL; rstrm.zfree = Z_NULL; rstrm.opaque = Z_NULL;
+  inflateInit(&rstrm);
+#endif
+
+  // These four variables are for debugging purposes.
+  long long read_bytes = 0;
+  long long read_acked_bytes = 0;
+  long long sent_bytes = 0;
+  long long sent_acked_bytes = 0;
+  long long cread_bytes = 0;
+  long long cread_acked_bytes = 0;
+  long long csent_bytes = 0;
+  long long csent_acked_bytes = 0;
+
+  SETOPT(s, TCP_CORK, 1);
+
+  int nfd = s < gDvm.offNetPipe[0] ? gDvm.offNetPipe[0] + 1 : s + 1;
+  while(1) {
+    if(wst == -1 && !auxQueueEmpty(&wthreads)) {
+      Thread* wthread = (Thread*)auxQueuePeek(&wthreads).v;
+}
+    
+
 static void message_loop(int s) {
   ALOGI("Starting message loop");
 
@@ -353,7 +412,7 @@ void* offControlLoop(void* junk) {
       return NULL;
     }
     
-    if(gDvm.isClient) {
+    if(gDvm.isClient || gDvm.isSlave) {
       struct timespec req;
       req.tv_sec = 1 << iter;
       req.tv_nsec = 0;
@@ -369,7 +428,7 @@ void* offControlLoop(void* junk) {
         close(s); s = -1;
         continue;
       }
-    } else if(gDvm.isMasterServer){
+    } else if(gDvm.isServer){
       int one = 1;
       setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
@@ -414,7 +473,12 @@ void* offControlLoop(void* junk) {
     /* Create the write event pipe.  We don't want to do it earlier before the
      * server/zygote forks as the messages will cross processes. */
     pipe(gDvm.offNetPipe);
-    message_loop(s);
+    if(gDvm.isClient)
+        message_loop(s);
+    else if(gDvm.isSlave)
+        message_loop_slave(s);
+    else if(gDvm.isServer)
+        meesage_loop_server(s);
     close(gDvm.offNetPipe[0]);
     close(gDvm.offNetPipe[1]);
 

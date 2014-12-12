@@ -29,6 +29,75 @@ static Thread* lookupThreadInHash(u4 threadId) {
   return result;
 }
 
+static void* thread_daemon_server(void* pself) {
+  Thread* self = (Thread*)pself;
+  while(1) {
+    u1 event = offReadU1(self);
+    if(!gDvm.offConnected) {
+      ALOGI("THREAD %d LOST CONNECTION", self->threadId);
+      return NULL;
+    }
+    ALOGI("THREAD %d GOT EVENT %d", self->threadId, event);
+    u4 result = redirectEvent(self, event);
+    // TODO: Fault handling for redirection.
+/*
+    switch(event) {
+      case OFF_ACTION_RESUME: {
+        return NULL;
+      } break;
+      case OFF_ACTION_LOCK: {
+        offPerformLockServer(self);
+      } break;
+      case OFF_ACTION_NOTIFY: {
+        offPerformNotifyServer(self);
+      } break;
+      case OFF_ACTION_BROADCAST: {
+        offPerformNotifyAllServer(self);
+      } break;
+      case OFF_ACTION_DEX_QUERYDEX: {
+        offPerformQueryDex(self);
+      } break;
+      case OFF_ACTION_SYNC: {
+        offSyncPull();
+        offWriteU1(self, 0);
+      } break;
+      case OFF_ACTION_INTERRUPT: {
+        offPerformInterrupt(self);
+      } break;
+      case OFF_ACTION_TRIMGC: {
+        dvmLockHeap();
+        self->offTrimSignaled = true;
+        if (gDvm.gcHeap->gcRunning) {
+          dvmWaitForConcurrentGcToComplete();
+        }
+        dvmCollectGarbageInternal(GC_BEFORE_OOM);
+        self->offTrimSignaled = false;
+        dvmUnlockHeap();
+      } break;
+      case OFF_ACTION_GRABVOL: {
+        offPerformGrabVolatiles(self);
+      } break;
+      case OFF_ACTION_MIGRATE: {
+        if(offPerformMigrate(self)) {
+          return NULL;
+        }
+      } break;
+      case OFF_ACTION_CLINIT: {
+        offPerformClinit(self);
+      } break;
+      case OFF_ACTION_DEATH: {
+        self->offFlagDeath = true;
+        return NULL;
+      } break;
+      default: {
+        ALOGE("Unknown action %d sent to thread %d",
+             event, self->threadId);
+        dvmAbort();
+      }
+    }*/
+  }
+}
+
 /* Runs the main thread daemmon loop looking for incoming messages from its
  * parallel thread on what action it should take. */
 static void* thread_daemon(void* pself) {
@@ -129,7 +198,9 @@ static void* thread_attach(void* args) {
   pthread_cond_broadcast(&gDvm.offThreadCreateCond);
   pthread_mutex_unlock(&gDvm.offThreadLock);
 
-  void* result = thread_daemon(self);
+  if(gDvm.isSlave) void* result = thread_daemon(self);
+  else void* result = thread_daemon_server(self);
+
 
   ALOGI("DETACHING THREAD %d", tid);
 

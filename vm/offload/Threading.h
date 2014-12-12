@@ -44,4 +44,13 @@ void offThreadExited(struct Thread* thread);
 bool offThreadingStartup();
 void offThreadingShutdown();
 
+typedef struct _ThreadTable {
+    ThreadTableEntry* entries;
+} ThreadTable;
+
+typedef struct _ThreadTableEntry {
+    u4 id;
+    u4 nodeId;
+} ThreadTableEntry;
+
 #endif // OFFLOAD_THREADING_H
