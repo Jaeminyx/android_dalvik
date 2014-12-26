@@ -749,7 +749,12 @@ bool offCommStartup() {
   pthread_mutex_init(&gDvm.offProxyLock, NULL);
   gDvm.offProxyFifo = auxFifoCreate();
   gDvm.offProxyFifoAll = auxFifoCreate();
+  gDvm.offForwardingQueue = auxFifoCreate();
   gDvm.offStatusUpdate = auxVectorCreate(0);
+
+  pthread_mutex_init(&gDvm.offSlaveLock, NULL);
+  pthread_mutex_init(&gDvm.offForwardingLock, NULL);
+
   return true;
 }
 

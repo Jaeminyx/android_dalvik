@@ -338,7 +338,7 @@ struct DvmGlobals {
     int         offJavaLangThread_contextClassLoader;
 
     /* method offsets - Thread */
-    int         voffJavaLangThread_run;
+    int         offJavaLangThread_run;
 
     /* field offsets - ThreadGroup */
     int         offJavaLangThreadGroup_name;
@@ -729,11 +729,22 @@ struct DvmGlobals {
 
 #ifdef WITH_OFFLOAD
     pthread_t       offControlThread;
+    pthread_t       offForwardingThread;
+
+    pthread_t       offSlaveThread[10];
+
+    u4              slaveNumber;
+    u1              slaveIdBitmap[10];
+    FifoBuffer      offForwardingQueue;
+    
 
     //bool isServer;
     bool isClient;
     bool isServer;
     bool isSlave;
+
+    pthread_mutex_t offSlaveLock;
+    pthread_mutex_t offForwardingLock;
 
     volatile bool offConnected;
     volatile bool offControlShutdown;
@@ -745,6 +756,8 @@ struct DvmGlobals {
     u8 offNetStatTime;
     u4 offNetRTT;
     u4 offNetRTTVar;
+
+    SlaveEntry  slaveEntries[10];
 
     int offNetPipe[2];
 

@@ -27,9 +27,6 @@
 #define CONTROL_DIAGNOSTIC_PORT_S "5554"
 #define CONTROL_TRANSPORT_PORT_S "5555"
 
-//#define CONTROL_MASTER_DIAGNOSTIC_PORT_S "6664"
-//#define CONTROL_MASTER_TRANSPORT_PORT_S "6665"
-
 #define MAX_CONTROL_VPACKET_SIZE (1<<16)
 
 // TODO: Move compression only into tcpmux layer.
@@ -57,9 +54,9 @@
     }
 
 typedef struct MsgHeader {
+  u4 slaveId;
   u4 id;
   u4 sz;
-  u4 kind;
 } MsgHeader;
 
 static u4 readFdFull(int fd) {
@@ -101,8 +98,7 @@ static int signalThread(void* pthread, void* arg) {
 }
 
 static void message_loop_server(int s) {
-    
-  ALOGI("Starting message loop");
+  ALOGI("Starting message loop server");
 
   u1 magic_value = 0x55;
   if(1 != write(s, &magic_value, 1)) return;
@@ -111,6 +107,7 @@ static void message_loop_server(int s) {
     ALOGW("Bad magic value from server");
     return;
   }
+
   gDvm.offConnected = true;
   gDvm.offRecovered = false;
 
@@ -123,7 +120,7 @@ static void message_loop_server(int s) {
   char rbuf[2*MAX_CONTROL_VPACKET_SIZE];
 
   MsgHeader whdr;
-  int wst = -1; u4 wsz = sizeof(whdr); u4 wpos = 0;
+  int wst = 0; u4 wsz = sizeof(whdr); u4 wpos = 0;
   u4 owsz = -1;
   char* wbuf = NULL;
 
@@ -154,10 +151,152 @@ static void message_loop_server(int s) {
 
   int nfd = s < gDvm.offNetPipe[0] ? gDvm.offNetPipe[0] + 1 : s + 1;
   while(1) {
-    if(wst == -1 && !auxQueueEmpty(&wthreads)) {
-      Thread* wthread = (Thread*)auxQueuePeek(&wthreads).v;
+    fd_set rdst; FD_ZERO(&rdst);
+    fd_set wrst; FD_ZERO(&wrst);
+    FD_SET(s, &rdst);
+    FD_SET(gDvm.offNetPipe[0], &rdst);
+    FD_SET(s, &wrst);
+    res = select(nfd, &rdst, &wrst, NULL, NULL);
+    CHECK_RESULT("select", res);
+
+    if(FD_ISSET(s, &rdst)) {
+      if(rst == 0) {
+        res = read(s, ((char*)&rhdr) + rpos, rsz - rpos);
+        CHECK_RESULT("read", res);
+        rpos += res;
+
+        if(rpos == rsz) {
+          rhdr.id = ntohl(rhdr.id);
+          rhdr.sz = ntohl(rhdr.sz);
+          rst = 1;
+          rpos = 0;
+          rsz = rhdr.sz;
+
+          if(rsz > MAX_CONTROL_VPACKET_SIZE) {
+            ALOGE("Invalid message size %d", rsz);
+            dvmAbort();
+          }
+        }
+      } else if(rst == 1) {
+        res = read(s, rbuf + rpos, rsz - rpos);
+        CHECK_RESULT("read", res);
+        rpos += res;
+
+        if(rpos == rsz) {
+#ifdef USE_COMPRESSION
+          /* Do the decompression and push the data to the thread. */
+          rstrm.avail_in = rsz;
+          rstrm.next_in = (unsigned char*)rbuf;
+          rstrm.avail_out = sizeof(rbuftmp);
+          rstrm.next_out = (unsigned char*)rbuftmp;
+          inflate(&rstrm, Z_SYNC_FLUSH);
+#endif
+
+          cread_bytes += rsz;
+          read_bytes += sizeof(rbuftmp) - rstrm.avail_out;
+          if(read_bytes - read_acked_bytes > (1<<10)) {
+           ALOGI("READ [b, db, cb, dcb] = [%lld, %lld, %lld, %lld]",
+                 read_bytes, read_bytes - read_acked_bytes,
+                 cread_bytes, cread_bytes - cread_acked_bytes);
+            read_acked_bytes = read_bytes;
+            cread_acked_bytes = cread_bytes;
+          }
+
+#ifdef USE_COMPRESSION
+          if(rstrm.avail_out != sizeof(rbuftmp)) {
+#else
+          if(rsz != 0) {
+#endif
+            Thread* rthread = rhdr.id ? offIdToThread(rhdr.id) :
+                                        &gDvm.gcThreadContext;
+            pthread_mutex_lock(&rthread->offBufferLock); {
+#ifdef USE_COMPRESSION
+              auxFifoPushData(&rthread->offReadBuffer, rbuftmp,
+                              sizeof(rbuftmp) - rstrm.avail_out);
+#else
+              auxFifoPushData(&rthread->offReadBuffer, rbuf, rsz);
+#endif
+              pthread_cond_signal(&rthread->offBufferCond);
+            } pthread_mutex_unlock(&rthread->offBufferLock);
+          }
+
+          rst = 0;
+          rpos = 0;
+          rsz = sizeof(MsgHeader);
+        }
+      }
+    }
+    if(FD_ISSET(s, &wrst)) {
+      if(wst == 0) {
+        res = write(s, ((char*)&whdr) + wpos, wsz - wpos);
+        CHECK_RESULT("write", res);
+        wpos += res;
+
+        if(wpos == wsz) {
+          wsz = ntohl(whdr.sz);
+          wpos = 0;
+          wst = 1;
+        }
+      } else if(wst == 1) {
+        res = write(s, wbuf, wsz - wpos);
+        CHECK_RESULT("write", res);
+        wbuf += res;
+        wpos += res;
+
+        if(wpos == wsz) {
+          wst = -1;
+
+          wthread = (Thread*)auxQueuePop(&wthreads).v;
+          pthread_mutex_lock(&wthread->offBufferLock); {
+            auxFifoPopBytes(&wthread->offWriteBuffer, owsz);
+            if(auxFifoEmpty(&wthread->offWriteBuffer)) {
+              /* If the write buffer is empty signal the thread so if it was
+               * waiting for a flush it will wake up. */
+              pthread_cond_signal(&wthread->offBufferCond);
+            } else {
+              auxQueuePushV(&wthreads, wthread);
+            }
+          } pthread_mutex_unlock(&wthread->offBufferLock);
+
+          if(auxQueueEmpty(&wthreads) && wthread->offCorkLevel == 0) {
+            /* We have nothing more to send right now.  Let any partial packets
+             * go over the wire now. */
+            SETOPT(s, TCP_NODELAY, 1);
+            SETOPT(s, TCP_NODELAY, 0);
+          }
+        }
+      }
+    }
+    if(FD_ISSET(gDvm.offNetPipe[0], &rdst)) {
+      wthread = (Thread*)readFdFull(gDvm.offNetPipe[0]);
+      if(wthread == NULL) {
+        /* We have been signaled to bail. */
+        return;
+      }
+      auxQueuePushV(&wthreads, wthread);
+    }
+  }
+
+  auxQueueDestroy(&wthreads);
+
+  /* Singal that we're no longer connected and wake up anybody who is waiting
+   * for the remote endpoint to do something. */
+  gDvm.offConnected = false;
+  gDvm.offNetStatTime = 0;
+  gDvm.offNetRTT = gDvm.offNetRTTVar = RTT_INFINITE;
+
+  /* Wake up those waiting on data. */
+  dvmHashTableLock(gDvm.offThreadTable); {
+    dvmHashForeach(gDvm.offThreadTable, signalThread, NULL);
+  } dvmHashTableUnlock(gDvm.offThreadTable);
+
+  /* Wake up those waiting on their turn to pull. */
+  pthread_mutex_lock(&gDvm.offCommLock); {
+    pthread_cond_broadcast(&gDvm.offPullCond);
+  } pthread_mutex_unlock(&gDvm.offCommLock);
+
+  offRecoveryWaitForClearance(NULL);
 }
-    
 
 static void message_loop(int s) {
   ALOGI("Starting message loop");
@@ -294,7 +433,7 @@ static void message_loop(int s) {
           cread_bytes += rsz;
           read_bytes += sizeof(rbuftmp) - rstrm.avail_out;
           if(read_bytes - read_acked_bytes > (1<<10)) {
-            ALOGI("READ [b, db, cb, dcb] = [%lld, %lld, %lld, %lld]",
+           ALOGI("READ [b, db, cb, dcb] = [%lld, %lld, %lld, %lld]",
                  read_bytes, read_bytes - read_acked_bytes,
                  cread_bytes, cread_bytes - cread_acked_bytes);
             read_acked_bytes = read_bytes;
@@ -397,6 +536,9 @@ static void message_loop(int s) {
   offRecoveryWaitForClearance(NULL);
 }
 
+void* offForwardingLoop(void* junk) {
+}
+
 void* offControlLoop(void* junk) {
   union {
     struct sockaddr_in addrin;
@@ -412,7 +554,7 @@ void* offControlLoop(void* junk) {
       return NULL;
     }
     
-    if(gDvm.isClient || gDvm.isSlave) {
+    if(!gDvm.isServer) {
       struct timespec req;
       req.tv_sec = 1 << iter;
       req.tv_nsec = 0;
@@ -428,7 +570,24 @@ void* offControlLoop(void* junk) {
         close(s); s = -1;
         continue;
       }
-    } else if(gDvm.isServer){
+      else {
+        int res;
+        u1 kind;
+        if(gDvm.isSlave) { // slave
+            kind = 0x00;
+            res = write(s, &kind, 1);
+        }
+        else if(gDvm.isClient) { // client
+            kind = 0x01;
+            res = write(s, &kind, 1);
+        }
+        if(res != 1){
+            close(s); s = -1;
+            continue;
+        }
+            
+      }
+    } else {
       int one = 1;
       setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
@@ -457,6 +616,11 @@ void* offControlLoop(void* junk) {
         if(s_cli == -1) {
           perror("accept");
         } else {
+          u1 kind; int res;
+          res = read(s_cli, &kind, 1);
+          if(kind == 0x00) offAddClient();
+          else if(kind == 0x01) offAddSlave();
+
           int pid = fork();
           if(pid == -1) {
             perror("fork");
@@ -473,12 +637,8 @@ void* offControlLoop(void* junk) {
     /* Create the write event pipe.  We don't want to do it earlier before the
      * server/zygote forks as the messages will cross processes. */
     pipe(gDvm.offNetPipe);
-    if(gDvm.isClient)
-        message_loop(s);
-    else if(gDvm.isSlave)
-        message_loop_slave(s);
-    else if(gDvm.isServer)
-        meesage_loop_server(s);
+    if(!gDvm.isServer) message_loop(s);
+    else message_loop_server(s);
     close(gDvm.offNetPipe[0]);
     close(gDvm.offNetPipe[1]);
 
@@ -500,6 +660,31 @@ bail:
   if(s != -1) close(s);
 
   return NULL;
+}
+
+void offAddClient() {
+}
+
+void offAddSlave() {
+    if(gDvm.slaveNumber >= 10) {
+    }
+    
+    pthread_mutex_lock(&gDvm.offSlaveLock);
+
+    gDvm.slaveNumver++;
+
+    u4 id = -1;
+
+    for(int i = 0; i < 10; i++) {
+        if(!gDvm.slaveIdBitmap[i]){
+            id = i+1; break;
+        }
+    }
+
+    gDvm.slaveEntries[i].id = i+1;
+
+
+
 }
 
 bool offWellConnected() {
@@ -651,7 +836,8 @@ bool offControlStartup(int afterZygote) {
     const char* env_slave = getenv("OFF_SLAVE");
     gDvm.isSlave = env_slave && !strcmp("1", env_slave);
 
-    gDvm.isClient = !(gDvm.isServer || gDvm.isSlave);
+    if(!(gDvm.isServer || gDvm.isSlave)) gDvm.isClient = true;
+    else gDvm.isClient = false;
 
     res = offThreadingStartup() &&
           offDexLoaderStartup() && offCommStartup() &&
@@ -676,12 +862,16 @@ bool offControlStartup(int afterZygote) {
     gDvm.offNetRTT = gDvm.offNetRTTVar = RTT_INFINITE;
     pthread_mutex_init(&gDvm.offNetStatLock, NULL);
     
+    gDvm.slaveNumber = 0;
     res = offEngineStartup();
     if(res && !gDvm.offDisabled) {
       res = gDvm.offDisabled || gDvm.isServer ||
             !pthread_create(&gDvm.offControlThread, NULL, offControlLoop, NULL);
     }
   }
+
+  //res = res && offFalutHandlingStartup();
+
   return res;
 }
 
